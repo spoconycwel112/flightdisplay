@@ -1,0 +1,324 @@
+document.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') e.preventDefault();
+    });
+
+    const darkMap = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap &copy; CARTO'
+    });
+
+    const satelliteMap = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 19,
+      attribution: 'Tiles &copy; Esri'
+    });
+
+    const labelsOverlay = L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}{r}.png', {
+      maxZoom: 19,
+      pane: 'shadowPane'
+    });
+
+    const hybridMap = L.layerGroup([satelliteMap, labelsOverlay]);
+
+    const map = L.map('map', {
+      center: [52.2297, 21.0122],
+      zoom: 6,
+      layers: [darkMap]
+    });
+
+    const baseMaps = {
+      "Dark": darkMap,
+      "Satellite": satelliteMap,
+      "Satellite + Labels": hybridMap
+    };
+    L.control.layers(baseMaps).addTo(map);
+
+    let flightData = [];
+    let flightGlobalImage = null;
+    let totalFlightDistanceKm = 0;
+    let cumulativeDistances = [];
+    let currentIndex = 0;
+    let animationTimeout = null;
+    let polylinePassed = null;
+    let polylineRemaining = null;
+    let planeMarker = null;
+
+    const statusDiv = document.getElementById('status');
+
+    function showStatus(msg, isError = true) {
+      statusDiv.style.display = 'block';
+      statusDiv.style.color = isError ? '#ff5555' : '#55ff55';
+      statusDiv.style.backgroundColor = isError ? '#2a1a1a' : '#1a2a1a';
+      statusDiv.innerText = msg;
+    }
+
+    function hideStatus() {
+      statusDiv.style.display = 'none';
+    }
+
+    function calculateDistanceKm(lat1, lon1, lat2, lon2) {
+      const R = 6371;
+      const dLat = (lat2 - lat1) * Math.PI / 180;
+      const dLon = (lon2 - lon1) * Math.PI / 180;
+      const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                Math.sin(dLon / 2) * Math.sin(dLon / 2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      return R * c;
+    }
+
+    function createPlaneIcon(heading) {
+      return L.divIcon({
+        html: `
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="32" height="32" style="transform: rotate(${heading}deg); transform-origin: center;">
+            <path fill="#ffcc00" stroke="#000" stroke-width="1.5" d="M21,16v-2l-8-5V3.5C13,2.67,12.33,2,11.5,2S10,2.67,10,3.5V9l-8,5v2l8-2.5V19l-2,1.5V22l3.5-1l3.5,1v-1.5L13,19v-5.5L21,16z"/>
+          </svg>`,
+        className: '',
+        iconSize: [32, 32],
+        iconAnchor: [16, 16]
+      });
+    }
+
+    function parseCSVText(text) {
+      const lines = text.split(/\r\n|\n/);
+      if (lines.length < 2) return [];
+
+      const result = [];
+      flightGlobalImage = null;
+
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+
+        const regex = /(?:,|\n|^)("(?:(?:"")*[^"]*)*"|[^",\n]*|)/g;
+        const row = [];
+        let matches = null;
+        
+        while ((matches = regex.exec(line)) !== null) {
+          if (matches.index === regex.lastIndex) {
+            regex.lastIndex++;
+          }
+          let val = matches[1];
+          if (val) {
+            val = val.replace(/^"|"$/g, '').trim();
+          }
+          row.push(val);
+        }
+
+        if (row.length >= 7) {
+          const posStr = row[3] || "";
+          const coords = posStr.split(',');
+
+          if (coords.length === 2) {
+            const lat = parseFloat(coords[0].trim());
+            const lon = parseFloat(coords[1].trim());
+
+            if (!isNaN(lat) && !isNaN(lon)) {
+              let imgUrl = row[7] || null;
+
+              if (imgUrl && imgUrl.startsWith('http') && !flightGlobalImage) {
+                flightGlobalImage = imgUrl;
+              }
+
+              result.push({
+                utc: row[1] || '-',
+                callsign: row[2] || 'N/A',
+                lat: lat,
+                lon: lon,
+                altitude: parseInt(row[4]) || 0,
+                speed: parseInt(row[5]) || 0,
+                direction: parseInt(row[6]) || 0,
+                imageUrl: imgUrl
+              });
+            }
+          }
+        }
+      }
+
+      cumulativeDistances = [0];
+      let runningDistance = 0;
+      for (let i = 1; i < result.length; i++) {
+        const prev = result[i - 1];
+        const curr = result[i];
+        const dist = calculateDistanceKm(prev.lat, prev.lon, curr.lat, curr.lon);
+        runningDistance += dist;
+        cumulativeDistances.push(runningDistance);
+      }
+      totalFlightDistanceKm = runningDistance;
+
+      return result;
+    }
+
+    document.getElementById('csvFile').addEventListener('change', function(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      hideStatus();
+
+      const reader = new FileReader();
+      reader.onload = function(evt) {
+        try {
+          const text = evt.target.result;
+          flightData = parseCSVText(text);
+
+          if (flightData.length === 0) {
+            showStatus("Error: No valid flight data found in file.");
+            return;
+          }
+
+          showStatus(`Successfully loaded ${flightData.length} track points!`, false);
+
+          const startUTC = flightData[0].utc;
+          const endUTC = flightData[flightData.length - 1].utc;
+          const totalNM = (totalFlightDistanceKm * 0.539957).toFixed(1);
+          
+          const formatTime = (tStr) => String(tStr).includes('T') ? tStr.split('T')[1].replace('Z', '') : tStr;
+
+          document.getElementById('valStartUTC').innerText = formatTime(startUTC);
+          document.getElementById('valEndUTC').innerText = formatTime(endUTC);
+          document.getElementById('valTotalDistance').innerText = `${totalFlightDistanceKm.toFixed(1)} km (${totalNM} NM)`;
+
+          const timeline = document.getElementById('timeline');
+          timeline.max = flightData.length - 1;
+          timeline.value = 0;
+          timeline.disabled = false;
+
+          document.getElementById('playBtn').disabled = false;
+          document.getElementById('resetBtn').disabled = false;
+          document.getElementById('skipBack1m').disabled = false;
+          document.getElementById('skipForward1m').disabled = false;
+          document.getElementById('skipBack10m').disabled = false;
+          document.getElementById('skipForward10m').disabled = false;
+          document.getElementById('speedSelect').disabled = false;
+
+          initFlightPath();
+          resetAnimation();
+        } catch (err) {
+          showStatus("Error parsing file: " + err.message);
+        }
+      };
+
+      reader.readAsText(file);
+    });
+
+    function initFlightPath() {
+      if (polylinePassed) map.removeLayer(polylinePassed);
+      if (polylineRemaining) map.removeLayer(polylineRemaining);
+      if (planeMarker) map.removeLayer(planeMarker);
+      planeMarker = null;
+
+      const allCoords = flightData.map(d => [d.lat, d.lon]);
+
+      polylineRemaining = L.polyline(allCoords, { color: '#aaaaaa', weight: 3, opacity: 0.6 }).addTo(map);
+      polylinePassed = L.polyline([], { color: '#ff3333', weight: 4, opacity: 0.9 }).addTo(map);
+
+      map.fitBounds(polylineRemaining.getBounds(), { padding: [50, 50] });
+    }
+
+    function updateUI(index) {
+      currentIndex = index;
+      const point = flightData[index];
+      if (!point) return;
+
+      document.getElementById('timeline').value = index;
+      
+      const timeStr = String(point.utc).includes('T') ? point.utc.split('T')[1].replace('Z', '') : point.utc;
+      document.getElementById('timeDisplay').innerText = `${index + 1} / ${flightData.length} [${timeStr}]`;
+
+      const currentDistKm = cumulativeDistances[index] || 0;
+      const currentDistNM = (currentDistKm * 0.539957).toFixed(1);
+
+      document.getElementById('valCallsign').innerText = point.callsign;
+      document.getElementById('valUTC').innerText = timeStr;
+      document.getElementById('valAltitude').innerText = `${point.altitude} ft`;
+      document.getElementById('valSpeed').innerText = `${point.speed} kts TAS`;
+      document.getElementById('valDirection').innerText = `${point.direction}°`;
+      document.getElementById('valCoveredDistance').innerText = `${currentDistKm.toFixed(1)} km (${currentDistNM} NM)`;
+
+      const imgEl = document.getElementById('aircraftImg');
+      const placeholderEl = document.getElementById('imgPlaceholder');
+      const currentImage = (point.imageUrl && point.imageUrl.startsWith('http')) ? point.imageUrl : flightGlobalImage;
+
+      if (currentImage) {
+        if (imgEl.src !== currentImage) {
+          imgEl.src = currentImage;
+        }
+        imgEl.style.display = 'block';
+        placeholderEl.style.display = 'none';
+      } else {
+        imgEl.style.display = 'none';
+        placeholderEl.style.display = 'block';
+      }
+
+      if (polylinePassed) {
+        const passedCoords = flightData.slice(0, index + 1).map(d => [d.lat, d.lon]);
+        polylinePassed.setLatLngs(passedCoords);
+      }
+
+      const latLng = [point.lat, point.lon];
+      const newIcon = createPlaneIcon(point.direction);
+
+      if (!planeMarker) {
+        planeMarker = L.marker(latLng, { icon: newIcon }).addTo(map);
+      } else {
+        planeMarker.setLatLng(latLng);
+        planeMarker.setIcon(newIcon);
+      }
+    }
+
+    document.getElementById('timeline').addEventListener('input', function(e) {
+      const idx = parseInt(e.target.value);
+      updateUI(idx);
+    });
+
+    function startAnimation() {
+      document.getElementById('playBtn').innerText = 'Pause';
+      
+      const step = () => {
+        const speed = parseFloat(document.getElementById('speedSelect').value);
+        const intervalTime = Math.max(10, 400 / speed);
+
+        if (currentIndex < flightData.length - 1) {
+          currentIndex++;
+          updateUI(currentIndex);
+          animationTimeout = setTimeout(step, intervalTime);
+        } else {
+          pauseAnimation();
+        }
+      };
+
+      step();
+    }
+
+    function pauseAnimation() {
+      clearTimeout(animationTimeout);
+      animationTimeout = null;
+      document.getElementById('playBtn').innerText = 'Play';
+    }
+
+    function resetAnimation() {
+      pauseAnimation();
+      currentIndex = 0;
+      if (flightData.length > 0) updateUI(0);
+    }
+
+    function jumpFrames(delta) {
+      if (flightData.length === 0) return;
+      let newIdx = Math.max(0, Math.min(flightData.length - 1, currentIndex + delta));
+      updateUI(newIdx);
+    }
+
+    document.getElementById('playBtn').addEventListener('click', function() {
+      if (animationTimeout) {
+        pauseAnimation();
+      } else {
+        startAnimation();
+      }
+    });
+
+    document.getElementById('resetBtn').addEventListener('click', resetAnimation);
+
+    // Przyciski skoku: 1 minuta (60s) i 10 minut (600s)
+    document.getElementById('skipBack1m').addEventListener('click', () => jumpFrames(-60));
+    document.getElementById('skipForward1m').addEventListener('click', () => jumpFrames(60));
+    document.getElementById('skipBack10m').addEventListener('click', () => jumpFrames(-600));
+    document.getElementById('skipForward10m').addEventListener('click', () => jumpFrames(600));
